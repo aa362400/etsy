@@ -1,0 +1,29 @@
+# Example product definition for the Etsy listing helper.
+# Copy this file, adjust the fields, and pass it to --product-file.
+title: "手工真丝发带"
+description: |
+  轻柔的真丝发带，适合日常佩戴或礼物。
+  - 100% 桑蚕丝
+  - 可手洗
+price: "28.00"
+quantity: 5
+taxonomy_id: 1118  # 更新为你的分类 ID
+who_made: i_did
+when_made: made_to_order
+is_supply: false
+shipping_profile_id: 123456789
+return_policy_id: 987654321
+tags:
+  - 真丝
+  - 发带
+  - 手工
+type: physical
+materials:
+  - silk
+  - elastic
+style:
+  - minimal
+should_auto_renew: true
+images:
+  - path: ./images/sample-headband.jpg
+    alt_text: "白色背景上的真丝发带"
