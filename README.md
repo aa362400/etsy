@@ -10,11 +10,12 @@ pip install -r requirements.txt
 
 ## 绑定店铺（一次操作）
 
-1. 在 [Etsy 开发者后台](https://www.etsy.com/developers/) 创建应用，记下 `client_id`（旧版称 API Key）。
+1. 在 [Etsy 开发者后台](https://www.etsy.com/developers/) 创建应用，记下 `client_id`（开发者后台显示为 **Keystring**，截图里的 `Shared Secret` 可填给 `--client-secret`，方便 Basic Auth 交换令牌）。个人应用 pending 审批也能用于自测。
 2. 运行授权命令，脚本会启动本地回调服务器并自动交换令牌，完成后把令牌缓存到 `~/.etsy_tokens.json`：
    ```bash
    python etsy_lister.py auth \
      --client-id "$ETSY_CLIENT_ID" \
+     --client-secret "$ETSY_CLIENT_SECRET" \
      --redirect-port 8787 \
      --scopes "listings_r listings_w shops_r transactions_r"
    ```

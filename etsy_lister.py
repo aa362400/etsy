@@ -198,8 +198,15 @@ def start_local_listener(host: str, port: int, timeout: int = 120) -> str:
     return code_holder["code"]
 
 
+def _build_basic_auth_header(client_id: str, client_secret: Optional[str]) -> Dict[str, str]:
+    if not client_secret:
+        return {}
+    token = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
 def exchange_code_for_token(
-    client_id: str, code: str, redirect_uri: str, verifier: str
+    client_id: str, code: str, redirect_uri: str, verifier: str, client_secret: Optional[str]
 ) -> Dict[str, Any]:
     data = {
         "grant_type": "authorization_code",
@@ -208,18 +215,22 @@ def exchange_code_for_token(
         "code": code,
         "code_verifier": verifier,
     }
-    response = requests.post(TOKEN_URL, data=data, timeout=30)
+    headers = _build_basic_auth_header(client_id, client_secret)
+    response = requests.post(TOKEN_URL, data=data, headers=headers, timeout=30)
     response.raise_for_status()
     return response.json()
 
 
-def refresh_access_token(client_id: str, refresh_token: str) -> Dict[str, Any]:
+def refresh_access_token(
+    client_id: str, refresh_token: str, client_secret: Optional[str]
+) -> Dict[str, Any]:
     data = {
         "grant_type": "refresh_token",
         "client_id": client_id,
         "refresh_token": refresh_token,
     }
-    response = requests.post(TOKEN_URL, data=data, timeout=30)
+    headers = _build_basic_auth_header(client_id, client_secret)
+    response = requests.post(TOKEN_URL, data=data, headers=headers, timeout=30)
     response.raise_for_status()
     return response.json()
 
@@ -237,7 +248,9 @@ def load_tokens(path: Path) -> Optional[MutableMapping[str, Any]]:
         return json.load(handle)
 
 
-def ensure_access_token(client_id: str, token_path: Path) -> str:
+def ensure_access_token(
+    client_id: str, client_secret: Optional[str], token_path: Path
+) -> str:
     tokens = load_tokens(token_path)
     if not tokens:
         raise SystemExit(
@@ -247,7 +260,9 @@ def ensure_access_token(client_id: str, token_path: Path) -> str:
     expires_at = tokens.get("expires_at")
     if expires_at and expires_at <= time.time():
         logging.info("Refreshing expired access token")
-        refreshed = refresh_access_token(client_id, tokens["refresh_token"])
+        refreshed = refresh_access_token(
+            client_id, tokens["refresh_token"], client_secret
+        )
         refreshed["expires_at"] = time.time() + int(refreshed.get("expires_in", 0))
         save_tokens(refreshed, token_path)
         tokens = refreshed
@@ -267,6 +282,11 @@ def parse_args() -> argparse.Namespace:
         "--client-id",
         default=os.getenv("ETSY_CLIENT_ID"),
         help="Etsy App client_id (formerly API key).",
+    )
+    parser.add_argument(
+        "--client-secret",
+        default=os.getenv("ETSY_CLIENT_SECRET"),
+        help="Optional Etsy App shared secret for Basic Auth token exchange.",
     )
     parser.add_argument(
         "--token-file",
@@ -366,7 +386,9 @@ def run_auth(args: argparse.Namespace) -> None:
         raise SystemExit(f"Authorization timeout: {exc}")
 
     print("Received authorization code. Exchanging for tokens...")
-    tokens = exchange_code_for_token(args.client_id, code, redirect_uri, verifier)
+    tokens = exchange_code_for_token(
+        args.client_id, code, redirect_uri, verifier, args.client_secret
+    )
     tokens["expires_at"] = time.time() + int(tokens.get("expires_in", 0))
     token_path = Path(args.token_file).expanduser()
     save_tokens(tokens, token_path)
@@ -395,7 +417,7 @@ def run_list(args: argparse.Namespace) -> None:
         return
 
     token_path = Path(args.token_file).expanduser()
-    access_token = ensure_access_token(args.client_id, token_path)
+    access_token = ensure_access_token(args.client_id, args.client_secret, token_path)
     session = create_session(args.client_id, access_token)
     listing_id = create_listing(session, args.shop_id, payload)
 
