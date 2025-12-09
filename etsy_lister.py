@@ -1,22 +1,28 @@
 """Command-line helper to create Etsy listings from a structured product file.
 
-The script posts directly to the Etsy V3 Open API. Provide credentials via
-`ETSY_API_KEY` and `ETSY_ACCESS_TOKEN` environment variables and optionally
-`ETSY_SHOP_ID` for the default shop.
+This revision removes the need to manually paste long-lived API tokens. Run the
+``auth`` command once to authorize the app against your shop, then the stored
+token is reused whenever you call the ``list`` command to create listings.
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import logging
 import os
+import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, MutableMapping
+from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional, Tuple
+from urllib.parse import urlencode, urlparse, parse_qs
 
 import requests
 import yaml
 
 API_BASE = "https://openapi.etsy.com/v3/application"
+AUTH_BASE = "https://www.etsy.com/oauth/connect"
+TOKEN_URL = "https://openapi.etsy.com/v3/public/oauth/token"
 REQUIRED_FIELDS = {
     "title",
     "description",
@@ -149,62 +155,228 @@ def publish_listing(session: requests.Session, listing_id: int) -> None:
     response.raise_for_status()
 
 
+def _generate_pkce_pair() -> Tuple[str, str]:
+    verifier = base64.urlsafe_b64encode(os.urandom(64)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    return verifier, challenge
+
+
+def start_local_listener(host: str, port: int, timeout: int = 120) -> str:
+    """Start a tiny HTTP server to capture the OAuth redirect code."""
+
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    code_holder: Dict[str, Optional[str]] = {"code": None}
+
+    class Handler(BaseHTTPRequestHandler):  # type: ignore[misc]
+        def do_GET(self) -> None:  # noqa: N802  (BaseHTTPRequestHandler naming)
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            code_holder["code"] = params.get("code", [None])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(
+                b"<html><body><h2>Etsy authorization received.</h2>"
+                b"You can close this window.</body></html>"
+            )
+
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+            return
+
+    server = HTTPServer((host, port), Handler)
+    server.timeout = timeout
+
+    start = time.time()
+    while time.time() - start < timeout and code_holder["code"] is None:
+        server.handle_request()
+
+    if code_holder["code"] is None:
+        raise TimeoutError("Did not receive authorization code before timeout")
+    return code_holder["code"]
+
+
+def exchange_code_for_token(
+    client_id: str, code: str, redirect_uri: str, verifier: str
+) -> Dict[str, Any]:
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code": code,
+        "code_verifier": verifier,
+    }
+    response = requests.post(TOKEN_URL, data=data, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def refresh_access_token(client_id: str, refresh_token: str) -> Dict[str, Any]:
+    data = {
+        "grant_type": "refresh_token",
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+    }
+    response = requests.post(TOKEN_URL, data=data, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def save_tokens(tokens: Mapping[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(tokens, handle, ensure_ascii=False, indent=2)
+
+
+def load_tokens(path: Path) -> Optional[MutableMapping[str, Any]]:
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def ensure_access_token(client_id: str, token_path: Path) -> str:
+    tokens = load_tokens(token_path)
+    if not tokens:
+        raise SystemExit(
+            f"No token file found at {token_path}. Run 'auth' command first."
+        )
+
+    expires_at = tokens.get("expires_at")
+    if expires_at and expires_at <= time.time():
+        logging.info("Refreshing expired access token")
+        refreshed = refresh_access_token(client_id, tokens["refresh_token"])
+        refreshed["expires_at"] = time.time() + int(refreshed.get("expires_in", 0))
+        save_tokens(refreshed, token_path)
+        tokens = refreshed
+
+    return tokens["access_token"]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Create Etsy listings from YAML/JSON definitions. Provide Etsy API "
-            "credentials via environment variables or explicit arguments."
+            "Authorize once, then create Etsy listings from YAML/JSON definitions "
+            "without manually managing tokens."
         )
     )
+
     parser.add_argument(
-        "--product-file",
-        required=True,
-        help="Path to YAML/JSON file describing the product listing.",
+        "--client-id",
+        default=os.getenv("ETSY_CLIENT_ID"),
+        help="Etsy App client_id (formerly API key).",
     )
     parser.add_argument(
-        "--shop-id",
-        default=os.getenv("ETSY_SHOP_ID"),
-        help="Numeric shop ID. Defaults to ETSY_SHOP_ID env variable.",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=os.getenv("ETSY_API_KEY"),
-        help="Etsy API key (x-api-key). Defaults to ETSY_API_KEY env variable.",
-    )
-    parser.add_argument(
-        "--access-token",
-        default=os.getenv("ETSY_ACCESS_TOKEN"),
-        help="OAuth access token. Defaults to ETSY_ACCESS_TOKEN env variable.",
-    )
-    parser.add_argument(
-        "--publish",
-        action="store_true",
-        help="Publish the listing after uploading images. Default creates a draft.",
-    )
-    parser.add_argument(
-        "--skip-images",
-        action="store_true",
-        help="Create the listing without uploading images.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print payloads without calling the Etsy API.",
+        "--token-file",
+        default=os.getenv("ETSY_TOKEN_FILE", "~/.etsy_tokens.json"),
+        help="Where to cache OAuth tokens after binding the shop.",
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging.",
     )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    auth_cmd = subparsers.add_parser(
+        "auth", help="Bind a shop by completing the Etsy OAuth flow."
+    )
+    auth_cmd.add_argument(
+        "--redirect-host",
+        default="localhost",
+        help="Host for the temporary callback server (default: localhost).",
+    )
+    auth_cmd.add_argument(
+        "--redirect-port",
+        type=int,
+        default=8787,
+        help="Port for the temporary callback server (default: 8787).",
+    )
+    auth_cmd.add_argument(
+        "--scopes",
+        default="listings_r listings_w shops_r transactions_r",
+        help="Space-separated scopes to request during authorization.",
+    )
+    auth_cmd.add_argument(
+        "--redirect-path",
+        default="/etsy/oauth/callback",
+        help="Path Etsy should redirect to after consent.",
+    )
+
+    list_cmd = subparsers.add_parser(
+        "list", help="Create a listing from a structured product file."
+    )
+    list_cmd.add_argument(
+        "--product-file",
+        required=True,
+        help="Path to YAML/JSON file describing the product listing.",
+    )
+    list_cmd.add_argument(
+        "--shop-id",
+        default=os.getenv("ETSY_SHOP_ID"),
+        help="Numeric shop ID. Defaults to ETSY_SHOP_ID env variable.",
+    )
+    list_cmd.add_argument(
+        "--publish",
+        action="store_true",
+        help="Publish the listing after uploading images. Default creates a draft.",
+    )
+    list_cmd.add_argument(
+        "--skip-images",
+        action="store_true",
+        help="Create the listing without uploading images.",
+    )
+    list_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print payloads without calling the Etsy API.",
+    )
+
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def run_auth(args: argparse.Namespace) -> None:
+    if not args.client_id:
+        raise SystemExit("Client ID is required. Set --client-id or ETSY_CLIENT_ID")
 
-    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
-    if not args.api_key or not args.access_token:
-        raise SystemExit("ETSY_API_KEY and ETSY_ACCESS_TOKEN are required")
+    redirect_uri = (
+        f"http://{args.redirect_host}:{args.redirect_port}{args.redirect_path}"
+    )
+    verifier, challenge = _generate_pkce_pair()
+    params = {
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": args.scopes,
+        "client_id": args.client_id,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    auth_url = f"{AUTH_BASE}?{urlencode(params)}"
+
+    print("1) Open this URL in your browser and approve the app:")
+    print(auth_url)
+    print("2) Waiting for Etsy to redirect back and capture the code...")
+
+    try:
+        code = start_local_listener(args.redirect_host, args.redirect_port)
+    except TimeoutError as exc:  # pragma: no cover - interactive flow
+        raise SystemExit(f"Authorization timeout: {exc}")
+
+    print("Received authorization code. Exchanging for tokens...")
+    tokens = exchange_code_for_token(args.client_id, code, redirect_uri, verifier)
+    tokens["expires_at"] = time.time() + int(tokens.get("expires_in", 0))
+    token_path = Path(args.token_file).expanduser()
+    save_tokens(tokens, token_path)
+
+    print(f"Tokens saved to {token_path}. You can now run the 'list' command.")
+
+
+def run_list(args: argparse.Namespace) -> None:
+    if not args.client_id:
+        raise SystemExit("Client ID is required. Set --client-id or ETSY_CLIENT_ID")
     if not args.shop_id:
         raise SystemExit("Shop ID is required (set --shop-id or ETSY_SHOP_ID)")
 
@@ -222,7 +394,9 @@ def main() -> None:
             print(json.dumps(images, indent=2, ensure_ascii=False))
         return
 
-    session = create_session(args.api_key, args.access_token)
+    token_path = Path(args.token_file).expanduser()
+    access_token = ensure_access_token(args.client_id, token_path)
+    session = create_session(args.client_id, access_token)
     listing_id = create_listing(session, args.shop_id, payload)
 
     if images and not args.skip_images:
@@ -232,6 +406,18 @@ def main() -> None:
         publish_listing(session, listing_id)
 
     print(f"Listing ready: {listing_id}")
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
+
+    if args.command == "auth":
+        run_auth(args)
+    elif args.command == "list":
+        run_list(args)
+    else:  # pragma: no cover - defensive
+        raise SystemExit(f"Unknown command: {args.command}")
 
 
 if __name__ == "__main__":
